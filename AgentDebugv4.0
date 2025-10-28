@@ -1,0 +1,461 @@
+import random
+import logging
+import unittest
+from typing import List, Tuple, Dict, Callable
+from collections import defaultdict
+import numpy as np
+from tabulate import tabulate
+import time
+import platform
+import resource  # For Unix-like systems
+import tracemalloc  # For Windows fallback
+from statistics import mean, stdev
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("benchmark_results.txt")]
+)
+logger = logging.getLogger(__name__)
+
+# Error Taxonomy with probabilities
+ERROR_TAXONOMY = {
+    "planning": {"reasoning_loop": 0.4, "incomplete_plan": 0.6},
+    "tool": {"tool_selection_error": 0.5, "invalid_tool_input": 0.5},
+    "memory": {"retrieval_failure": 0.7, "context_overflow": 0.3},
+    "system": {"execution_timeout": 0.6, "resource_limit_exceeded": 0.4}
+}
+
+# Simulated Agent Step
+class Step:
+    def __init__(self, state: str, action: str, module: str):
+        if module not in ERROR_TAXONOMY:
+            raise ValueError(f"Invalid module: {module}. Must be one of {list(ERROR_TAXONOMY.keys())}")
+        self.state = state
+        self.action = action
+        self.module = module
+        self.error = None
+
+# Agent Trajectory
+class Trajectory:
+    def __init__(self, steps: List[Step]):
+        if not steps:
+            raise ValueError("Trajectory cannot be empty")
+        self.steps = steps
+        self.success = False
+
+    def evaluate(self) -> bool:
+        critical_modules = ["planning", "tool"]
+        error_count = sum(1 for step in self.steps if step.error)
+        critical_error = any(step.error and step.module in critical_modules for step in self.steps)
+        self.success = error_count <= 1 and not critical_error
+        return self.success
+
+# Q-learning Agent for Debugging
+class DebuggingAgent:
+    def __init__(self, modules: List[str], learning_rate: float = 0.1, discount_factor: float = 0.9, epsilon: float = 0.1):
+        self.modules = modules
+        self.q_table = defaultdict(lambda: np.zeros(len(modules)))
+        self.learning_rate = learning_rate
+        self.discount_factor = discount_factor
+        self.epsilon = epsilon
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+        self.q_changes = []
+
+    def get_state(self, trajectory: Trajectory) -> tuple:
+        error_counts = {module: 0 for module in self.modules}
+        last_error = {module: "none" for module in self.modules}
+        for step in trajectory.steps:
+            if step.error:
+                error_counts[step.module] += 1
+                last_error[step.module] = step.error
+        return tuple(error_counts[module] for module in self.modules) + \
+               tuple(last_error[module] for module in self.modules)
+
+    def choose_action(self, state: tuple) -> str:
+        if random.random() < self.epsilon:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+            return random.choice(self.modules)
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        return self.modules[np.argmax(self.q_table[state])]
+
+    def update_q_table(self, state: tuple, action: str, reward: float, next_state: tuple):
+        action_idx = self.modules.index(action)
+        current_q = self.q_table[state][action_idx]
+        next_max_q = np.max(self.q_table[next_state])
+        new_q = current_q + self.learning_rate * (reward + self.discount_factor * next_max_q - current_q)
+        self.q_changes.append(abs(new_q - current_q))
+        self.q_table[state][action_idx] = new_q
+
+# Performance Benchmarker
+class Benchmarker:
+    def __init__(self):
+        self.timings = defaultdict(list)
+        self.memory_usages = []
+        self.success_rates = []
+        self.iterations_to_success = []
+        self.q_changes = []
+        self.is_windows = platform.system() == "Windows"
+        if self.is_windows:
+            tracemalloc.start()
+
+    def measure_time(self, func, *args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start_time
+        self.timings[func.__name__].append(elapsed)
+        return result
+
+    def measure_memory(self):
+        if not self.is_windows:
+            # Use resource module on Unix-like systems
+            try:
+                mem = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # Convert KB to MB
+            except (AttributeError, resource.error):
+                mem = 0  # Fallback if resource is unavailable
+        else:
+            # Use tracemalloc on Windows
+            current, peak = tracemalloc.get_traced_memory()
+            mem = peak / 1024 / 1024  # Convert bytes to MB
+        self.memory_usages.append(mem)
+        return mem
+
+    def log_results(self, scenario: str, trajectory_size: int, query: str):
+        avg_times = {k: mean(v) for k, v in self.timings.items()}
+        std_times = {k: stdev(v) if len(v) > 1 else 0 for k, v in self.timings.items()}
+        avg_memory = mean(self.memory_usages) if self.memory_usages else 0
+        max_memory = max(self.memory_usages) if self.memory_usages else 0
+        success_rate = mean(self.success_rates) * 100 if self.success_rates else 0
+        avg_iterations = mean(self.iterations_to_success) if self.iterations_to_success else 0
+        avg_q_change = mean(self.q_changes) if self.q_changes else 0
+
+        table = [
+            ["Scenario", scenario],
+            ["Trajectory Size", trajectory_size],
+            ["Query", query],
+            ["Avg Fine-Grained Analysis Time (s)", f"{avg_times.get('fine_grained_analysis', 0):.4f} ± {std_times.get('fine_grained_analysis', 0):.4f}"],
+            ["Avg Critical Error Detection Time (s)", f"{avg_times.get('detect_critical_error', 0):.4f} ± {std_times.get('detect_critical_error', 0):.4f}"],
+            ["Avg Iterative Debugging Time (s)", f"{avg_times.get('iterative_debugging', 0):.4f} ± {std_times.get('iterative_debugging', 0):.4f}"],
+            ["Avg Agent Invoke Time (s)", f"{avg_times.get('invoke', 0):.4f} ± {std_times.get('invoke', 0):.4f}"],
+            ["Avg Memory Usage (MB)", f"{avg_memory:.2f}"],
+            ["Peak Memory Usage (MB)", f"{max_memory:.2f}"],
+            ["Success Rate (%)", f"{success_rate:.2f}"],
+            ["Avg Iterations to Success", f"{avg_iterations:.2f}"],
+            ["Avg Q-Value Change", f"{avg_q_change:.4f}"]
+        ]
+        logger.info("\nBenchmark Results:\n" + tabulate(table, headers=["Metric", "Value"], tablefmt="grid"))
+
+    def __del__(self):
+        if self.is_windows:
+            tracemalloc.stop()
+
+# Stage 1: Fine-grained Analysis
+def fine_grained_analysis(trajectory: Trajectory, taxonomy: Dict) -> None:
+    for step in trajectory.steps:
+        if random.random() < 0.3:
+            if step.module == "memory" and "incomplete" in step.state.lower():
+                step.error = "retrieval_failure"
+            elif step.module == "tool" and "invalid" in step.action.lower():
+                step.error = "invalid_tool_input"
+            elif step.module == "planning" and "complex" in step.action.lower():
+                step.error = "reasoning_loop"
+            else:
+                errors, probs = zip(*taxonomy[step.module].items())
+                step.error = random.choices(errors, weights=probs, k=1)[0]
+            logger.debug(f"Step {trajectory.steps.index(step) + 1} ({step.module}): Error - {step.error}")
+
+# Stage 2: Optimized Critical Error Detection
+def detect_critical_error(trajectory: Trajectory) -> Tuple[int, str, str]:
+    if trajectory.evaluate():
+        return -1, "", ""
+    for i, step in enumerate(trajectory.steps):
+        if step.error and step.module in ["planning", "tool"]:
+            return i, step.module, step.error or "assumed_root_cause"
+    return -1, "", ""
+
+# Stage 3: Iterative Debugging with RL
+def iterative_debugging(trajectory: Trajectory, max_iterations: int, rl_agent: DebuggingAgent, benchmarker: Benchmarker) -> bool:
+    if max_iterations < 1:
+        raise ValueError("max_iterations must be positive")
+
+    iteration = 0
+    feedback_history = []
+    feedback = "Initial feedback: Check all modules for errors."
+
+    while iteration < max_iterations:
+        benchmarker.measure_time(fine_grained_analysis, trajectory, ERROR_TAXONOMY)
+        state = rl_agent.get_state(trajectory)
+        module_to_debug = rl_agent.choose_action(state)
+        critical_step, critical_module, critical_error = benchmarker.measure_time(detect_critical_error, trajectory)
+
+        if critical_step == -1:
+            logger.info("Trajectory successful after debugging!")
+            trajectory.success = True
+            benchmarker.iterations_to_success.append(iteration + 1)
+            benchmarker.success_rates.append(1)
+            rl_agent.update_q_table(state, module_to_debug, reward=1.0, next_state=rl_agent.get_state(trajectory))
+            benchmarker.q_changes.extend(rl_agent.q_changes)
+            rl_agent.q_changes.clear()
+            return True
+
+        corrected = False
+        for i, step in enumerate(trajectory.steps):
+            if step.module == module_to_debug and step.error:
+                step.action = "corrected_" + step.action
+                step.error = None
+                corrected = True
+                break
+
+        reward = 1.0 if trajectory.success else \
+                 0.5 if corrected and module_to_debug in ["planning", "tool"] else \
+                 0.3 if corrected else -0.1 - 0.05 * iteration
+
+        feedback = (f"Refined feedback: Focused on {module_to_debug}. "
+                    f"Critical error at step {critical_step + 1} ({critical_module}): {critical_error}. "
+                    f"History: {', '.join(feedback_history) if feedback_history else 'None'}")
+        feedback_history.append(f"{critical_module}: {critical_error}")
+        logger.info(f"Iteration {iteration + 1}: {feedback}")
+
+        next_state = rl_agent.get_state(trajectory)
+        rl_agent.update_q_table(state, module_to_debug, reward, next_state)
+        benchmarker.q_changes.extend(rl_agent.q_changes)
+        rl_agent.q_changes.clear()
+
+        iteration += 1
+
+    logger.warning("Max iterations reached, debugging failed.")
+    benchmarker.success_rates.append(0)
+    benchmarker.iterations_to_success.append(max_iterations)
+    return False
+
+# Pretty-print trajectory
+def print_trajectory(trajectory: Trajectory):
+    table = [[i + 1, step.module, step.action, step.error or "None"] for i, step in enumerate(trajectory.steps)]
+    headers = ["Step", "Module", "Action", "Error"]
+    logger.info("\n" + tabulate(table, headers=headers, tablefmt="grid"))
+
+# Custom Tool Class
+class Tool:
+    def __init__(self, name: str, func: Callable[[str], str], description: str):
+        self.name = name
+        self.func = func
+        self.description = description
+
+    def invoke(self, input: str) -> str:
+        try:
+            return self.func(input)
+        except Exception as e:
+            raise ValueError(f"Tool {self.name} failed: {str(e)}")
+
+# Define Real-World Tools
+def web_search_tool_func(query: str) -> str:
+    try:
+        return f"Web search results for: {query}"
+    except Exception as e:
+        raise ValueError(f"Web search failed: {str(e)}")
+
+def code_analysis_tool_func(query: str) -> str:
+    return f"Code analysis results for: {query}"
+
+web_search_tool = Tool(
+    name="web_search",
+    func=web_search_tool_func,
+    description="Performs a web search based on the input query."
+)
+
+code_analysis_tool = Tool(
+    name="code_analysis",
+    func=code_analysis_tool_func,
+    description="Analyzes code or queries related to code debugging."
+)
+
+# Custom Agent
+class SimpleAgent:
+    def __init__(self, tools: List[Tool], memory_size: int = 5):
+        self.tools = {tool.name: tool for tool in tools}
+        self.memory = []
+        self.memory_size = memory_size
+
+    def update_memory(self, query: str, response: str):
+        self.memory.append({"query": query, "response": response})
+        if len(self.memory) > self.memory_size:
+            self.memory.pop(0)
+
+    def retrieve_memory(self, query: str) -> str:
+        scored_items = [
+            (item, sum(1 for word in query.lower().split() if word in item["query"].lower()))
+            for item in self.memory
+        ]
+        scored_items.sort(key=lambda x: x[1], reverse=True)
+        return "\n".join(
+            f"Query: {item[0]['query']}, Response: {item[0]['response']}"
+            for item in scored_items[:2] if item[1] > 0
+        )
+
+    def select_tool(self, query: str) -> str:
+        tool_scores = {tool_name: 0 for tool_name in self.tools}
+        for tool_name, tool in self.tools.items():
+            tool_scores[tool_name] = sum(
+                1 for keyword in tool.description.lower().split() if keyword in query.lower()
+            )
+        return max(tool_scores, key=tool_scores.get, default="no_tool")
+
+    def invoke(self, query: str) -> dict:
+        try:
+            plan_action = "reason_query"
+            plan_state = f"Query: {query}"
+            if "complex" in query.lower():
+                plan_action = "reason_complex_query"
+
+            memory_context = self.retrieve_memory(query)
+            memory_state = f"Memory context for: {query}" if memory_context else f"Incomplete memory for: {query}"
+
+            tool_action = self.select_tool(query)
+            tool_result = None
+            if tool_action != "no_tool":
+                if tool_action in self.tools:
+                    tool_result = self.tools[tool_action].invoke(query)
+                else:
+                    tool_action = "invalid_tool_selection"
+
+            response = tool_result if tool_result else f"Processed query: {query}"
+            response_action = "generate_response"
+
+            self.update_memory(query, response)
+
+            steps = [
+                Step(plan_state, plan_action, "planning"),
+                Step(memory_state, "retrieve_context", "memory"),
+                Step(f"Tool call for: {query}", tool_action, "tool"),
+                Step(f"Response state: {query}", response_action, "planning"),
+                Step(f"Update memory for: {query}", "store_context", "memory")
+            ]
+
+            return {"output": response, "trajectory": Trajectory(steps)}
+        except Exception as e:
+            steps = [
+                Step(f"Error state: {str(e)}", "handle_error", "system")
+            ]
+            return {"output": f"Error: {str(e)}", "trajectory": Trajectory(steps)}
+
+# Simulate Agent Execution
+def simulate_agent_trajectory(agent: SimpleAgent, query: str, trajectory_size: int = 5) -> Trajectory:
+    result = agent.invoke(query)
+    trajectory = result["trajectory"]
+    if trajectory_size > len(trajectory.steps):
+        for i in range(len(trajectory.steps), trajectory_size):
+            module = random.choice(list(ERROR_TAXONOMY.keys()))
+            trajectory.steps.append(Step(f"State {i+1}", f"action{i+1}", module))
+    logger.info(f"Agent response: {result['output']}")
+    return trajectory
+
+# Benchmarking Function
+def run_benchmarks():
+    benchmarker = Benchmarker()
+    scenarios = [
+        {"name": "Small Trajectory, Simple Query", "size": 5, "query": "Find AI info"},
+        {"name": "Medium Trajectory, Simple Query", "size": 100, "query": "Find AI info"},
+        {"name": "Large Trajectory, Complex Query", "size": 1000, "query": "Complex query for AI debugging analysis"}
+    ]
+    runs_per_scenario = 10
+
+    for scenario in scenarios:
+        benchmarker.timings.clear()
+        benchmarker.memory_usages.clear()
+        benchmarker.success_rates.clear()
+        benchmarker.iterations_to_success.clear()
+        benchmarker.q_changes.clear()
+
+        logger.info(f"\nRunning benchmark for {scenario['name']} (Size: {scenario['size']}, Query: {scenario['query']})")
+        for run in range(runs_per_scenario):
+            logger.info(f"Run {run + 1}/{runs_per_scenario}")
+            rl_agent = DebuggingAgent(modules=list(ERROR_TAXONOMY.keys()), learning_rate=0.1, discount_factor=0.9, epsilon=0.1)
+            agent = SimpleAgent(tools=[web_search_tool, code_analysis_tool])
+            
+            benchmarker.measure_memory()
+            trajectory = benchmarker.measure_time(simulate_agent_trajectory, agent, scenario["query"], scenario["size"])
+            benchmarker.measure_memory()
+            benchmarker.measure_time(fine_grained_analysis, trajectory, ERROR_TAXONOMY)
+            benchmarker.measure_memory()
+            success = benchmarker.measure_time(iterative_debugging, trajectory, max_iterations=5, rl_agent=rl_agent, benchmarker=benchmarker)
+            benchmarker.measure_memory()
+        
+        benchmarker.log_results(scenario["name"], scenario["size"], scenario["query"])
+
+# Main execution
+def main():
+    rl_agent = DebuggingAgent(modules=list(ERROR_TAXONOMY.keys()), learning_rate=0.1, discount_factor=0.9, epsilon=0.1)
+    agent = SimpleAgent(tools=[web_search_tool, code_analysis_tool])
+    benchmarker = Benchmarker()
+
+    query = "Find information about AI debugging"
+    logger.info(f"Simulating agent for query: {query}")
+    trajectory = benchmarker.measure_time(simulate_agent_trajectory, agent, query)
+    benchmarker.measure_memory()
+
+    logger.info("Initial Trajectory Analysis:")
+    benchmarker.measure_time(fine_grained_analysis, trajectory, ERROR_TAXONOMY)
+    print_trajectory(trajectory)
+    logger.info(f"Initial success: {trajectory.evaluate()}")
+
+    logger.info("\nStarting AgentDebug Process:")
+    success = benchmarker.measure_time(iterative_debugging, trajectory, max_iterations=3, rl_agent=rl_agent, benchmarker=benchmarker)
+    benchmarker.measure_memory()
+
+    logger.info(f"\nFinal Trajectory Success: {success}")
+    print_trajectory(trajectory)
+
+# Unit tests
+class TestAgentDebug(unittest.TestCase):
+    def test_step_validation(self):
+        with self.assertRaises(ValueError):
+            Step("State 1", "action1", "invalid_module")
+
+    def test_trajectory_empty(self):
+        with self.assertRaises(ValueError):
+            Trajectory([])
+
+    def test_fine_grained_analysis(self):
+        steps = [Step("Incomplete State 1", "action1", "memory")]
+        trajectory = Trajectory(steps)
+        fine_grained_analysis(trajectory, ERROR_TAXONOMY)
+        self.assertIn(trajectory.steps[0].error, list(ERROR_TAXONOMY["memory"].keys()) + [None])
+
+    def test_evaluate(self):
+        steps = [Step("State 1", "action1", "memory"), Step("State 2", "action2", "planning")]
+        trajectory = Trajectory(steps)
+        self.assertTrue(trajectory.evaluate())
+        steps[1].error = "reasoning_loop"
+        self.assertFalse(trajectory.evaluate())
+
+    def test_agent_tool(self):
+        agent = SimpleAgent(tools=[web_search_tool])
+        result = agent.invoke("Find AI info")
+        self.assertIn("Web search results", result["output"])
+        self.assertEqual(len(result["trajectory"].steps), 5)
+
+    def test_debugging_agent(self):
+        rl_agent = DebuggingAgent(modules=["planning", "tool"], learning_rate=0.1, discount_factor=0.9, epsilon=0.0)
+        state = (0, 0, "none", "none")
+        action = rl_agent.choose_action(state)
+        self.assertIn(action, rl_agent.modules)
+        rl_agent.update_q_table(state, action, 1.0, (0, 0, "none", "none"))
+        self.assertGreater(rl_agent.q_table[state][rl_agent.modules.index(action)], 0)
+
+    def test_iterative_debugging(self):
+        steps = [Step("State 1", "action1", "memory")]
+        trajectory = Trajectory(steps)
+        rl_agent = DebuggingAgent(modules=["memory"], epsilon=0.0)
+        benchmarker = Benchmarker()
+        success = iterative_debugging(trajectory, max_iterations=1, rl_agent=rl_agent, benchmarker=benchmarker)
+        self.assertTrue(success or not trajectory.steps[0].error)
+
+if __name__ == "__main__":
+    # Run benchmarks
+    run_benchmarks()
+    # Run main execution
+    main()
+    # Run unit tests
+    unittest.main(argv=[''], exit=False)
